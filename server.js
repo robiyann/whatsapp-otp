@@ -11,7 +11,6 @@ const {
   renderDashboard,
   renderUsersPage,
   renderNumbersPage,
-  renderAccessPage,
   renderLogsPage,
 } = require('./lib/admin-ui');
 
@@ -120,18 +119,25 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
-function normalizeSender(value) {
+function normalizeKey(value) {
   return String(value || '')
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '');
 }
 
-function identifyNumber(sender) {
-  const normalizedSender = normalizeSender(sender);
+function identifyNumber(numberKey, sender) {
+  const normalizedNumberKey = normalizeKey(numberKey);
+  const normalizedSender = normalizeKey(sender);
   const candidates = store.listNumbers().filter(number => number.isActive);
+
+  if (normalizedNumberKey) {
+    const byNumberKey = candidates.find(number => normalizeKey(number.numberKey) === normalizedNumberKey);
+    if (byNumberKey) return byNumberKey;
+  }
+
   return candidates.find(number => {
-    const senderKey = normalizeSender(number.senderKey);
+    const senderKey = normalizeKey(number.senderKey);
     if (!senderKey) return false;
     return normalizedSender === senderKey
       || normalizedSender.includes(senderKey)
@@ -153,12 +159,14 @@ function extractOTP(text) {
 
 function formatOTPMessage(number, sender, otp) {
   const time = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Bangkok' });
-  const safeLabel = escapeHtml(number ? number.label : sender || 'Unknown sender');
+  const safeLabel = escapeHtml(number ? number.label : sender || 'Unknown number');
+  const safeNumberKey = escapeHtml(number ? number.numberKey : '-');
   const safeSender = escapeHtml(sender || '-');
   const safeOtp = escapeHtml(otp || '');
 
   return [
     `<b>${safeLabel}</b>`,
+    `Number: ${safeNumberKey}`,
     `OTP: <code>${safeOtp}</code>`,
     `Sender: ${safeSender}`,
     `Waktu: ${escapeHtml(time)}`,
@@ -198,22 +206,23 @@ function ensureAdminSeed() {
   for (const chatId of ADMIN_TELEGRAM_IDS) {
     store.upsertTelegramUser({
       telegramChatId: chatId,
-      displayName: `Admin ${chatId}`,
+      username: '',
       isAdmin: true,
       isActive: true,
     });
   }
 }
 
-async function routeOtp({ sender, text, source }) {
+async function routeOtp({ numberKey, sender, text, source }) {
   const otp = extractOTP(text);
   if (!otp) {
     return { status: 'skipped', reason: 'no OTP detected' };
   }
 
-  const number = identifyNumber(sender);
+  const number = identifyNumber(numberKey, sender);
   if (!number) {
     store.logOtp({
+      numberKey,
       sender,
       otp,
       rawText: text,
@@ -229,6 +238,7 @@ async function routeOtp({ sender, text, source }) {
     store.logOtp({
       numberId: number.id,
       numberLabel: number.label,
+      numberKey: number.numberKey,
       sender,
       otp,
       rawText: text,
@@ -247,11 +257,12 @@ async function routeOtp({ sender, text, source }) {
     if (sent) deliveredTo.push(user.telegramChatId);
   }
 
-  store.logOtp({
-    numberId: number.id,
-    numberLabel: number.label,
-    sender,
-    otp,
+    store.logOtp({
+      numberId: number.id,
+      numberLabel: number.label,
+      numberKey: number.numberKey,
+      sender,
+      otp,
     rawText: text,
     status: deliveredTo.length > 0 ? 'forwarded' : 'send_failed',
     deliveryCount: deliveredTo.length,
@@ -263,6 +274,7 @@ async function routeOtp({ sender, text, source }) {
     status: deliveredTo.length > 0 ? 'forwarded' : 'send_failed',
     otp,
     number: number.label,
+    numberKey: number.numberKey,
     sender,
     sentTo: deliveredTo.length,
     recipients: deliveredTo,
@@ -351,17 +363,15 @@ app.get('/admin/users', requireAdmin, (req, res) => {
 
 app.post('/admin/users', requireAdmin, (req, res) => {
   const telegramChatId = sanitizeText(req.body.telegramChatId);
-  const displayName = sanitizeText(req.body.displayName);
 
-  if (!telegramChatId || !displayName) {
-    setFlash(res, 'Telegram Chat ID dan display name wajib diisi.');
+  if (!telegramChatId) {
+    setFlash(res, 'Telegram Chat ID wajib diisi.');
     return res.redirect('/admin/users');
   }
 
   store.createUser({
     telegramChatId,
     username: sanitizeText(req.body.username),
-    displayName,
     isAdmin: parseBoolean(req.body.isAdmin),
     isActive: parseBoolean(req.body.isActive),
   });
@@ -395,27 +405,59 @@ app.get('/admin/numbers', requireAdmin, (req, res) => {
   res.send(renderNumbersPage({
     flash: req.flash,
     numbers,
+    users: store.listUsers().filter(user => !user.isAdmin),
     userMap,
   }));
 });
 
 app.post('/admin/numbers', requireAdmin, (req, res) => {
   const label = sanitizeText(req.body.label);
+  const numberKey = sanitizeText(req.body.numberKey);
   const senderKey = sanitizeText(req.body.senderKey);
 
-  if (!label || !senderKey) {
-    setFlash(res, 'Label dan sender key wajib diisi.');
+  if (!label || !numberKey) {
+    setFlash(res, 'Label dan number key wajib diisi.');
     return res.redirect('/admin/numbers');
   }
 
-  store.createNumber({
-    label,
-    senderKey,
-    description: sanitizeText(req.body.description),
-    isActive: parseBoolean(req.body.isActive),
-  });
+  try {
+    const number = store.createNumber({
+      label,
+      numberKey,
+      senderKey,
+      description: sanitizeText(req.body.description),
+      isActive: parseBoolean(req.body.isActive),
+    });
+    store.replaceNumberAccess(number.id, [].concat(req.body.userIds || []).map(sanitizeText));
+  } catch (error) {
+    setFlash(res, `Gagal menyimpan nomor: ${error.message}`);
+    return res.redirect('/admin/numbers');
+  }
 
   setFlash(res, 'Nomor OTP berhasil disimpan.');
+  return res.redirect('/admin/numbers');
+});
+
+app.post('/admin/numbers/:id', requireAdmin, (req, res) => {
+  const number = store.getNumberById(req.params.id);
+  if (!number) {
+    setFlash(res, 'Nomor tidak ditemukan.');
+    return res.redirect('/admin/numbers');
+  }
+
+  try {
+    store.updateNumber(number.id, {
+      label: sanitizeText(req.body.label),
+      numberKey: sanitizeText(req.body.numberKey),
+      senderKey: sanitizeText(req.body.senderKey),
+      description: sanitizeText(req.body.description),
+      isActive: parseBoolean(req.body.isActive),
+    });
+    store.replaceNumberAccess(number.id, [].concat(req.body.userIds || []).map(sanitizeText));
+    setFlash(res, 'Nomor berhasil diperbarui.');
+  } catch (error) {
+    setFlash(res, `Gagal memperbarui nomor: ${error.message}`);
+  }
   return res.redirect('/admin/numbers');
 });
 
@@ -434,35 +476,6 @@ app.post('/admin/numbers/:id/delete', requireAdmin, (req, res) => {
   return res.redirect('/admin/numbers');
 });
 
-app.get('/admin/access', requireAdmin, (req, res) => {
-  res.send(renderAccessPage({
-    flash: req.flash,
-    users: store.listUsers(),
-    numbers: store.listNumbers(),
-    assignments: store.getAssignments(),
-  }));
-});
-
-app.post('/admin/access/assign', requireAdmin, (req, res) => {
-  const userId = sanitizeText(req.body.userId);
-  const numberId = sanitizeText(req.body.numberId);
-
-  if (!store.getUserById(userId) || !store.getNumberById(numberId)) {
-    setFlash(res, 'User atau nomor tidak ditemukan.');
-    return res.redirect('/admin/access');
-  }
-
-  store.assignAccess(userId, numberId);
-  setFlash(res, 'Access berhasil ditambahkan.');
-  return res.redirect('/admin/access');
-});
-
-app.post('/admin/access/revoke', requireAdmin, (req, res) => {
-  store.revokeAccess(sanitizeText(req.body.userId), sanitizeText(req.body.numberId));
-  setFlash(res, 'Access berhasil dicabut.');
-  return res.redirect('/admin/access');
-});
-
 app.get('/admin/logs', requireAdmin, (req, res) => {
   res.send(renderLogsPage({
     flash: req.flash,
@@ -476,6 +489,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   try {
+    const numberKey = sanitizeText(req.body.number_key || req.body.numberKey || req.body.receiver_number || req.body.device_id || req.body.sim_label);
     const sender = sanitizeText(req.body.sender || req.body.title || req.body.from);
     const text = sanitizeText(req.body.text || req.body.message || req.body.content);
 
@@ -483,7 +497,7 @@ app.post('/webhook', async (req, res) => {
       return res.json({ status: 'skipped', reason: 'empty message' });
     }
 
-    const result = await routeOtp({ sender, text, source: 'webhook' });
+    const result = await routeOtp({ numberKey, sender, text, source: 'webhook' });
     return res.json({
       ...result,
       timestamp: new Date().toISOString(),
@@ -500,6 +514,7 @@ app.get('/forward', async (req, res) => {
   }
 
   try {
+    const numberKey = sanitizeText(req.query.number_key || req.query.numberKey || req.query.receiver_number || req.query.device_id || req.query.sim_label);
     const sender = sanitizeText(req.query.sender || req.query.from);
     const text = sanitizeText(req.query.text || req.query.message);
 
@@ -507,7 +522,7 @@ app.get('/forward', async (req, res) => {
       return res.json({ status: 'skipped', reason: 'empty message' });
     }
 
-    const result = await routeOtp({ sender, text, source: 'query-forward' });
+    const result = await routeOtp({ numberKey, sender, text, source: 'query-forward' });
     return res.json({
       ...result,
       timestamp: new Date().toISOString(),
@@ -561,14 +576,12 @@ async function pollTelegramUpdates() {
 
       const chatId = String(msg.chat.id);
       const username = msg.from && msg.from.username ? msg.from.username : '';
-      const firstName = msg.from && msg.from.first_name ? msg.from.first_name : chatId;
       const command = String(msg.text).trim().toLowerCase();
       const isSeedAdmin = ADMIN_TELEGRAM_IDS.includes(chatId);
 
       const user = store.upsertTelegramUser({
         telegramChatId: chatId,
         username,
-        displayName: firstName,
         isAdmin: isSeedAdmin ? true : undefined,
         isActive: isSeedAdmin ? true : undefined,
       });
@@ -596,7 +609,7 @@ async function pollTelegramUpdates() {
         const numbers = store.getNumbersForUser(user.id);
         const lines = [
           `<b>Status akun</b>`,
-          `Nama: ${escapeHtml(user.displayName)}`,
+          `Username: ${escapeHtml(user.username ? `@${user.username}` : '-')}`,
           `Aktif: ${user.isActive ? 'ya' : 'tidak'}`,
           `Role: ${user.isAdmin ? 'admin' : 'user'}`,
           `Jumlah nomor: ${numbers.length}`,
