@@ -86,6 +86,11 @@ Masuk ke halaman `Numbers`, lalu isi:
 - `Description`: opsional
 - checklist user yang boleh menerima OTP
 
+Nomor juga bisa muncul otomatis:
+
+- jika webhook masuk membawa `number_key` baru yang belum ada di database, backend akan auto-create nomor itu
+- setelah muncul di panel, kamu tinggal rapikan label dan atur user yang boleh menerima OTP
+
 Contoh:
 
 - Label: `WA Slot 1`
@@ -151,6 +156,7 @@ Backend akan mencari nomor dengan urutan ini:
 
 1. Cocokkan `number_key` dari webhook ke `number_key` di panel
 2. Jika tidak ada, fallback ke `sender` dan cocokkan ke `sender fallback`
+3. Jika `number_key` baru dan belum ada di database, backend akan membuat data nomor otomatis
 
 Jadi untuk multi nomor, yang paling aman adalah **selalu kirim `number_key` dari MacroDroid**.
 

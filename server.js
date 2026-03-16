@@ -219,7 +219,20 @@ async function routeOtp({ numberKey, sender, text, source }) {
     return { status: 'skipped', reason: 'no OTP detected' };
   }
 
-  const number = identifyNumber(numberKey, sender);
+  let number = identifyNumber(numberKey, sender);
+  if (!number && numberKey) {
+    try {
+      number = store.createNumber({
+        label: numberKey,
+        numberKey,
+        senderKey: sender || '',
+        description: 'Auto-created from webhook',
+        isActive: true,
+      });
+    } catch (error) {
+      number = identifyNumber(numberKey, sender);
+    }
+  }
   if (!number) {
     store.logOtp({
       numberKey,
@@ -357,6 +370,7 @@ app.get('/admin/users', requireAdmin, (req, res) => {
   res.send(renderUsersPage({
     flash: req.flash,
     users,
+    numbers: store.listNumbers(),
     numberMap,
   }));
 });
@@ -385,6 +399,28 @@ app.post('/admin/users/:id/toggle', requireAdmin, (req, res) => {
   if (user) {
     store.updateUser(user.id, { isActive: !user.isActive });
     setFlash(res, 'Status user diperbarui.');
+  }
+  return res.redirect('/admin/users');
+});
+
+app.post('/admin/users/:id', requireAdmin, (req, res) => {
+  const user = store.getUserById(req.params.id);
+  if (!user) {
+    setFlash(res, 'User tidak ditemukan.');
+    return res.redirect('/admin/users');
+  }
+
+  try {
+    store.updateUser(user.id, {
+      telegramChatId: sanitizeText(req.body.telegramChatId),
+      username: sanitizeText(req.body.username),
+      isAdmin: parseBoolean(req.body.isAdmin),
+      isActive: parseBoolean(req.body.isActive),
+    });
+    store.replaceUserAccess(user.id, [].concat(req.body.numberIds || []).map(sanitizeText));
+    setFlash(res, 'User berhasil diperbarui.');
+  } catch (error) {
+    setFlash(res, `Gagal memperbarui user: ${error.message}`);
   }
   return res.redirect('/admin/users');
 });
@@ -453,7 +489,6 @@ app.post('/admin/numbers/:id', requireAdmin, (req, res) => {
       description: sanitizeText(req.body.description),
       isActive: parseBoolean(req.body.isActive),
     });
-    store.replaceNumberAccess(number.id, [].concat(req.body.userIds || []).map(sanitizeText));
     setFlash(res, 'Nomor berhasil diperbarui.');
   } catch (error) {
     setFlash(res, `Gagal memperbarui nomor: ${error.message}`);
