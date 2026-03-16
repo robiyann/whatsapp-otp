@@ -1,139 +1,558 @@
 require('dotenv').config();
+
+const crypto = require('crypto');
 const express = require('express');
 const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
+
+const { Store } = require('./lib/store');
+const {
+  escapeHtml,
+  renderLoginPage,
+  renderDashboard,
+  renderUsersPage,
+  renderNumbersPage,
+  renderAccessPage,
+  renderLogsPage,
+} = require('./lib/admin-ui');
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+const store = new Store();
 
-// ==================== CONFIG ====================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const PORT = process.env.PORT || 3200;
-const FILTER_NUMBERS = process.env.FILTER_NUMBERS
-  ? process.env.FILTER_NUMBERS.split(',').map(n => n.trim())
-  : [];
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-// ==================== SUBSCRIBERS ====================
-const SUBSCRIBERS_FILE = path.join(__dirname, 'subscribers.json');
-const LOG_FILE = path.join(__dirname, 'messages.log');
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const PORT = Number(process.env.PORT || 3200);
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
+  .split(',')
+  .map(value => value.trim())
+  .filter(Boolean);
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const sessions = new Map();
 
-function loadSubscribers() {
-  try {
-    if (fs.existsSync(SUBSCRIBERS_FILE)) {
-      return JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE, 'utf-8'));
-    }
-  } catch (err) {
-    console.error('⚠️ Error loading subscribers:', err.message);
+function createSession() {
+  const token = crypto.randomBytes(24).toString('hex');
+  sessions.set(token, {
+    createdAt: Date.now(),
+    expiresAt: Date.now() + SESSION_TTL_MS,
+  });
+  return token;
+}
+
+function getSession(token) {
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return null;
   }
-  return {};
+  session.expiresAt = Date.now() + SESSION_TTL_MS;
+  return session;
 }
 
-function saveSubscribers(subs) {
-  fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subs, null, 2));
+function destroySession(token) {
+  if (token) sessions.delete(token);
 }
 
-// { chatId: { username, firstName, subscribedAt } }
-let subscribers = loadSubscribers();
-
-// ==================== LOG ====================
-function logMessage(data) {
-  const timestamp = new Date().toISOString();
-  const logEntry = `[${timestamp}] From: ${data.sender || 'Unknown'} | Message: ${data.text || 'N/A'}\n`;
-  fs.appendFileSync(LOG_FILE, logEntry);
-  console.log(logEntry.trim());
+function parseCookies(cookieHeader) {
+  return String(cookieHeader || '')
+    .split(';')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const index = part.indexOf('=');
+      if (index === -1) return cookies;
+      const key = part.slice(0, index);
+      const value = part.slice(index + 1);
+      cookies[key] = decodeURIComponent(value);
+      return cookies;
+    }, {});
 }
 
-// ==================== TELEGRAM SEND ====================
-async function sendToTelegram(chatId, text) {
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-        parse_mode: 'HTML',
-      }),
-    });
-    const result = await res.json();
-    if (!result.ok) {
-      console.error(`❌ Telegram error (chat ${chatId}):`, result.description);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error(`❌ Send failed (chat ${chatId}):`, err.message);
-    return false;
+function setCookie(res, name, value, options = {}) {
+  const pieces = [`${name}=${encodeURIComponent(value)}`];
+  if (options.maxAge !== undefined) pieces.push(`Max-Age=${options.maxAge}`);
+  pieces.push(`Path=${options.path || '/'}`);
+  if (options.httpOnly !== false) pieces.push('HttpOnly');
+  if (options.sameSite) pieces.push(`SameSite=${options.sameSite}`);
+  const existing = res.getHeader('Set-Cookie');
+  const nextValue = pieces.join('; ');
+  if (!existing) {
+    res.setHeader('Set-Cookie', nextValue);
+    return;
   }
+  if (Array.isArray(existing)) {
+    res.setHeader('Set-Cookie', [...existing, nextValue]);
+    return;
+  }
+  res.setHeader('Set-Cookie', [existing, nextValue]);
 }
 
-// Broadcast to ALL subscribers
-async function broadcastToSubscribers(text) {
-  const chatIds = Object.keys(subscribers);
-  if (chatIds.length === 0) {
-    console.log('⚠️ Tidak ada subscriber. Kirim /start ke bot untuk subscribe.');
-    return 0;
-  }
-
-  let successCount = 0;
-  for (const chatId of chatIds) {
-    const sent = await sendToTelegram(chatId, text);
-    if (sent) successCount++;
-  }
-
-  console.log(`✅ Broadcast ke ${successCount}/${chatIds.length} subscriber`);
-  return successCount;
+function clearCookie(res, name) {
+  setCookie(res, name, '', { maxAge: 0, sameSite: 'Lax' });
 }
 
-// ==================== EXTRACT OTP ====================
+function withFlash(req, res, next) {
+  const cookies = parseCookies(req.headers.cookie);
+  if (cookies.flash) {
+    req.flash = cookies.flash;
+    clearCookie(res, 'flash');
+  } else {
+    req.flash = '';
+  }
+  next();
+}
+
+function setFlash(res, message) {
+  setCookie(res, 'flash', message, { maxAge: 15, sameSite: 'Lax' });
+}
+
+function requireAdmin(req, res, next) {
+  const cookies = parseCookies(req.headers.cookie);
+  const token = cookies.admin_session;
+  if (!token || !getSession(token)) {
+    return res.redirect('/admin/login');
+  }
+  req.adminSession = token;
+  return next();
+}
+
+function normalizeSender(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
+}
+
+function identifyNumber(sender) {
+  const normalizedSender = normalizeSender(sender);
+  const candidates = store.listNumbers().filter(number => number.isActive);
+  return candidates.find(number => {
+    const senderKey = normalizeSender(number.senderKey);
+    if (!senderKey) return false;
+    return normalizedSender === senderKey
+      || normalizedSender.includes(senderKey)
+      || senderKey.includes(normalizedSender);
+  }) || null;
+}
+
 function extractOTP(text) {
   if (!text) return null;
 
-  // Pattern 1: "123456 is your verification code" (angka di awal)
   const pattern1 = text.match(/^\s*(\d{4,8})\s+(?:is your|adalah)/i);
   if (pattern1) return pattern1[1];
 
-  // Pattern 2: "Your code is 123456" / "kode: 123456"
-  const pattern2 = text.match(/(?:code|kode|OTP|pin|verifikasi|verification)[:\s]+(?:is\s+)?(\d{4,8})\b/i);
+  const pattern2 = text.match(/(?:otp|code|kode|pin|verifikasi|verification)\D{0,12}(\d{4,8})\b/i);
   if (pattern2) return pattern2[1];
-
-  // Pattern 3: Any standalone 4-8 digit number in the message
-  const pattern3 = text.match(/\b(\d{4,8})\b/);
-  if (pattern3) return pattern3[1];
 
   return null;
 }
 
-// ==================== FORMAT OTP MESSAGE ====================
-function formatOTPMessage(sender, otp) {
-  const time = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-  return `🔑 <code>${otp}</code>\n👤 ${sender} • ${time}`;
+function formatOTPMessage(number, sender, otp) {
+  const time = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Bangkok' });
+  const safeLabel = escapeHtml(number ? number.label : sender || 'Unknown sender');
+  const safeSender = escapeHtml(sender || '-');
+  const safeOtp = escapeHtml(otp || '');
+
+  return [
+    `<b>${safeLabel}</b>`,
+    `OTP: <code>${safeOtp}</code>`,
+    `Sender: ${safeSender}`,
+    `Waktu: ${escapeHtml(time)}`,
+  ].join('\n');
 }
 
-// ==================== FILTER CHECK ====================
-function shouldForward(sender) {
-  if (FILTER_NUMBERS.length === 0) return true;
-  return FILTER_NUMBERS.some(num => {
-    if (!sender) return false;
-    return sender.includes(num) || num.includes(sender);
-  });
-}
-
-// ==================== TELEGRAM BOT POLLING ====================
-let lastUpdateId = 0;
-
-async function pollTelegramUpdates() {
-  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'your_bot_token_here') return;
+async function sendToTelegram(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'your_bot_token_here') {
+    return false;
+  }
 
   try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`;
-    const res = await fetch(url);
-    const data = await res.json();
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+      }),
+    });
 
-    if (!data.ok || !data.result) return;
+    const result = await response.json();
+    if (!result.ok) {
+      console.error(`Telegram send failed for ${chatId}:`, result.description);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`Telegram send failed for ${chatId}:`, error.message);
+    return false;
+  }
+}
+
+function ensureAdminSeed() {
+  for (const chatId of ADMIN_TELEGRAM_IDS) {
+    store.upsertTelegramUser({
+      telegramChatId: chatId,
+      displayName: `Admin ${chatId}`,
+      isAdmin: true,
+      isActive: true,
+    });
+  }
+}
+
+async function routeOtp({ sender, text, source }) {
+  const otp = extractOTP(text);
+  if (!otp) {
+    return { status: 'skipped', reason: 'no OTP detected' };
+  }
+
+  const number = identifyNumber(sender);
+  if (!number) {
+    store.logOtp({
+      sender,
+      otp,
+      rawText: text,
+      status: 'unassigned_number',
+      deliveryCount: 0,
+      deliveredTo: [],
+    });
+    return { status: 'skipped', reason: 'unknown sender', otp };
+  }
+
+  const recipients = store.getUsersForNumber(number.id);
+  if (recipients.length === 0) {
+    store.logOtp({
+      numberId: number.id,
+      numberLabel: number.label,
+      sender,
+      otp,
+      rawText: text,
+      status: 'no_assigned_users',
+      deliveryCount: 0,
+      deliveredTo: [],
+    });
+    return { status: 'no_recipients', number: number.label, otp };
+  }
+
+  const formatted = formatOTPMessage(number, sender, otp);
+  const deliveredTo = [];
+
+  for (const user of recipients) {
+    const sent = await sendToTelegram(user.telegramChatId, formatted);
+    if (sent) deliveredTo.push(user.telegramChatId);
+  }
+
+  store.logOtp({
+    numberId: number.id,
+    numberLabel: number.label,
+    sender,
+    otp,
+    rawText: text,
+    status: deliveredTo.length > 0 ? 'forwarded' : 'send_failed',
+    deliveryCount: deliveredTo.length,
+    deliveredTo,
+    source,
+  });
+
+  return {
+    status: deliveredTo.length > 0 ? 'forwarded' : 'send_failed',
+    otp,
+    number: number.label,
+    sender,
+    sentTo: deliveredTo.length,
+    recipients: deliveredTo,
+  };
+}
+
+function webhookAuthorized(req) {
+  if (!WEBHOOK_SECRET) return true;
+  const headerSecret = req.headers['x-webhook-secret'];
+  const bodySecret = req.body && req.body.secret;
+  const querySecret = req.query && req.query.secret;
+  return [headerSecret, bodySecret, querySecret].some(secret => secret === WEBHOOK_SECRET);
+}
+
+function sanitizeText(value) {
+  return String(value || '').trim();
+}
+
+function parseBoolean(value) {
+  return String(value) === 'true';
+}
+
+function metrics() {
+  const users = store.listUsers();
+  const numbers = store.listNumbers();
+  return {
+    activeUsers: users.filter(user => user.isActive).length,
+    activeNumbers: numbers.filter(number => number.isActive).length,
+    assignments: store.getAssignments().length,
+    otpLogs: store.listOtpLogs(500).length,
+  };
+}
+
+ensureAdminSeed();
+
+app.use(withFlash);
+
+app.get('/admin/login', (req, res) => {
+  res.send(renderLoginPage({ error: req.flash }));
+});
+
+app.post('/admin/login', (req, res) => {
+  const username = sanitizeText(req.body.username);
+  const password = sanitizeText(req.body.password);
+
+  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+    return res.send(renderLoginPage({ error: 'Username atau password salah.' }));
+  }
+
+  const session = createSession();
+  setCookie(res, 'admin_session', session, {
+    maxAge: Math.floor(SESSION_TTL_MS / 1000),
+    sameSite: 'Lax',
+  });
+  return res.redirect('/admin');
+});
+
+app.post('/admin/logout', (req, res) => {
+  const cookies = parseCookies(req.headers.cookie);
+  destroySession(cookies.admin_session);
+  clearCookie(res, 'admin_session');
+  return res.redirect('/admin/login');
+});
+
+app.get('/admin', requireAdmin, (req, res) => {
+  res.send(renderDashboard({
+    flash: req.flash,
+    metrics: metrics(),
+    recentLogs: store.listOtpLogs(8),
+  }));
+});
+
+app.get('/admin/users', requireAdmin, (req, res) => {
+  const users = store.listUsers();
+  const numberMap = users.reduce((acc, user) => {
+    acc[user.id] = store.getNumbersForUser(user.id);
+    return acc;
+  }, {});
+
+  res.send(renderUsersPage({
+    flash: req.flash,
+    users,
+    numberMap,
+  }));
+});
+
+app.post('/admin/users', requireAdmin, (req, res) => {
+  const telegramChatId = sanitizeText(req.body.telegramChatId);
+  const displayName = sanitizeText(req.body.displayName);
+
+  if (!telegramChatId || !displayName) {
+    setFlash(res, 'Telegram Chat ID dan display name wajib diisi.');
+    return res.redirect('/admin/users');
+  }
+
+  store.createUser({
+    telegramChatId,
+    username: sanitizeText(req.body.username),
+    displayName,
+    isAdmin: parseBoolean(req.body.isAdmin),
+    isActive: parseBoolean(req.body.isActive),
+  });
+
+  setFlash(res, 'User berhasil disimpan.');
+  return res.redirect('/admin/users');
+});
+
+app.post('/admin/users/:id/toggle', requireAdmin, (req, res) => {
+  const user = store.getUserById(req.params.id);
+  if (user) {
+    store.updateUser(user.id, { isActive: !user.isActive });
+    setFlash(res, 'Status user diperbarui.');
+  }
+  return res.redirect('/admin/users');
+});
+
+app.post('/admin/users/:id/delete', requireAdmin, (req, res) => {
+  store.deleteUser(req.params.id);
+  setFlash(res, 'User dihapus.');
+  return res.redirect('/admin/users');
+});
+
+app.get('/admin/numbers', requireAdmin, (req, res) => {
+  const numbers = store.listNumbers();
+  const userMap = numbers.reduce((acc, number) => {
+    acc[number.id] = store.getUsersForNumber(number.id);
+    return acc;
+  }, {});
+
+  res.send(renderNumbersPage({
+    flash: req.flash,
+    numbers,
+    userMap,
+  }));
+});
+
+app.post('/admin/numbers', requireAdmin, (req, res) => {
+  const label = sanitizeText(req.body.label);
+  const senderKey = sanitizeText(req.body.senderKey);
+
+  if (!label || !senderKey) {
+    setFlash(res, 'Label dan sender key wajib diisi.');
+    return res.redirect('/admin/numbers');
+  }
+
+  store.createNumber({
+    label,
+    senderKey,
+    description: sanitizeText(req.body.description),
+    isActive: parseBoolean(req.body.isActive),
+  });
+
+  setFlash(res, 'Nomor OTP berhasil disimpan.');
+  return res.redirect('/admin/numbers');
+});
+
+app.post('/admin/numbers/:id/toggle', requireAdmin, (req, res) => {
+  const number = store.getNumberById(req.params.id);
+  if (number) {
+    store.updateNumber(number.id, { isActive: !number.isActive });
+    setFlash(res, 'Status nomor diperbarui.');
+  }
+  return res.redirect('/admin/numbers');
+});
+
+app.post('/admin/numbers/:id/delete', requireAdmin, (req, res) => {
+  store.deleteNumber(req.params.id);
+  setFlash(res, 'Nomor dihapus.');
+  return res.redirect('/admin/numbers');
+});
+
+app.get('/admin/access', requireAdmin, (req, res) => {
+  res.send(renderAccessPage({
+    flash: req.flash,
+    users: store.listUsers(),
+    numbers: store.listNumbers(),
+    assignments: store.getAssignments(),
+  }));
+});
+
+app.post('/admin/access/assign', requireAdmin, (req, res) => {
+  const userId = sanitizeText(req.body.userId);
+  const numberId = sanitizeText(req.body.numberId);
+
+  if (!store.getUserById(userId) || !store.getNumberById(numberId)) {
+    setFlash(res, 'User atau nomor tidak ditemukan.');
+    return res.redirect('/admin/access');
+  }
+
+  store.assignAccess(userId, numberId);
+  setFlash(res, 'Access berhasil ditambahkan.');
+  return res.redirect('/admin/access');
+});
+
+app.post('/admin/access/revoke', requireAdmin, (req, res) => {
+  store.revokeAccess(sanitizeText(req.body.userId), sanitizeText(req.body.numberId));
+  setFlash(res, 'Access berhasil dicabut.');
+  return res.redirect('/admin/access');
+});
+
+app.get('/admin/logs', requireAdmin, (req, res) => {
+  res.send(renderLogsPage({
+    flash: req.flash,
+    logs: store.listOtpLogs(150),
+  }));
+});
+
+app.post('/webhook', async (req, res) => {
+  if (!webhookAuthorized(req)) {
+    return res.status(401).json({ status: 'error', message: 'invalid webhook secret' });
+  }
+
+  try {
+    const sender = sanitizeText(req.body.sender || req.body.title || req.body.from);
+    const text = sanitizeText(req.body.text || req.body.message || req.body.content);
+
+    if (!text) {
+      return res.json({ status: 'skipped', reason: 'empty message' });
+    }
+
+    const result = await routeOtp({ sender, text, source: 'webhook' });
+    return res.json({
+      ...result,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('Webhook error:', error.message);
+    return res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/forward', async (req, res) => {
+  if (!webhookAuthorized(req)) {
+    return res.status(401).json({ status: 'error', message: 'invalid webhook secret' });
+  }
+
+  try {
+    const sender = sanitizeText(req.query.sender || req.query.from);
+    const text = sanitizeText(req.query.text || req.query.message);
+
+    if (!text) {
+      return res.json({ status: 'skipped', reason: 'empty message' });
+    }
+
+    const result = await routeOtp({ sender, text, source: 'query-forward' });
+    return res.json({
+      ...result,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    return res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.get('/logs', requireAdmin, (req, res) => {
+  return res.json({
+    count: store.listOtpLogs(50).length,
+    logs: store.listOtpLogs(50),
+  });
+});
+
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    service: 'OTP Control Room',
+    adminPanel: '/admin/login',
+    webhook: 'POST /webhook',
+    queryForward: 'GET /forward',
+    metrics: metrics(),
+  });
+});
+
+let lastUpdateId = 0;
+let polling = false;
+
+async function pollTelegramUpdates() {
+  if (polling || !TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'your_bot_token_here') {
+    return;
+  }
+
+  polling = true;
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=20`
+    );
+    const data = await response.json();
+
+    if (!data.ok || !Array.isArray(data.result)) {
+      return;
+    }
 
     for (const update of data.result) {
       lastUpdateId = update.update_id;
@@ -141,158 +560,69 @@ async function pollTelegramUpdates() {
       if (!msg || !msg.text) continue;
 
       const chatId = String(msg.chat.id);
-      const username = msg.from.username || '';
-      const firstName = msg.from.first_name || '';
-      const command = msg.text.trim().toLowerCase();
+      const username = msg.from && msg.from.username ? msg.from.username : '';
+      const firstName = msg.from && msg.from.first_name ? msg.from.first_name : chatId;
+      const command = String(msg.text).trim().toLowerCase();
+      const isSeedAdmin = ADMIN_TELEGRAM_IDS.includes(chatId);
+
+      const user = store.upsertTelegramUser({
+        telegramChatId: chatId,
+        username,
+        displayName: firstName,
+        isAdmin: isSeedAdmin ? true : undefined,
+        isActive: isSeedAdmin ? true : undefined,
+      });
 
       if (command === '/start') {
-        subscribers[chatId] = {
-          username,
-          firstName,
-          subscribedAt: new Date().toISOString(),
-        };
-        saveSubscribers(subscribers);
-        console.log(`✅ New subscriber: ${firstName} (@${username}) [${chatId}]`);
-        await sendToTelegram(chatId,
-          `✅ <b>Subscribed!</b>\n\n` +
-          `Kamu akan menerima forward pesan WhatsApp.\n\n` +
-          `<b>Commands:</b>\n` +
-          `/start - Subscribe\n` +
-          `/stop - Unsubscribe\n` +
-          `/status - Cek status`
-        );
-      } else if (command === '/stop') {
-        delete subscribers[chatId];
-        saveSubscribers(subscribers);
-        console.log(`🔴 Unsubscribed: ${firstName} (@${username}) [${chatId}]`);
-        await sendToTelegram(chatId, `🔴 <b>Unsubscribed.</b>\nKamu tidak akan menerima forward pesan lagi.\nKirim /start untuk subscribe kembali.`);
+        if (user.isAdmin) {
+          await sendToTelegram(chatId, '<b>Admin ready.</b>\nBuka panel web untuk mengatur access.');
+        } else if (user.isActive) {
+          const numbers = store.getNumbersForUser(user.id);
+          const labels = numbers.length
+            ? numbers.map(number => `- ${escapeHtml(number.label)}`).join('\n')
+            : '- Belum ada nomor yang di-assign';
+
+          await sendToTelegram(
+            chatId,
+            `<b>Akses aktif.</b>\nKamu akan menerima OTP untuk nomor berikut:\n${labels}`
+          );
+        } else {
+          await sendToTelegram(
+            chatId,
+            '<b>Permintaan diterima.</b>\nAdmin perlu mengaktifkan akunmu dulu sebelum OTP bisa dikirim.'
+          );
+        }
       } else if (command === '/status') {
-        const subCount = Object.keys(subscribers).length;
-        const isSubscribed = !!subscribers[chatId];
-        await sendToTelegram(chatId,
-          `📊 <b>Status</b>\n\n` +
-          `🔔 Kamu: ${isSubscribed ? '✅ Subscribed' : '❌ Not subscribed'}\n` +
-          `👥 Total subscribers: ${subCount}\n` +
-          `🟢 Server: Online`
+        const numbers = store.getNumbersForUser(user.id);
+        const lines = [
+          `<b>Status akun</b>`,
+          `Nama: ${escapeHtml(user.displayName)}`,
+          `Aktif: ${user.isActive ? 'ya' : 'tidak'}`,
+          `Role: ${user.isAdmin ? 'admin' : 'user'}`,
+          `Jumlah nomor: ${numbers.length}`,
+        ];
+        await sendToTelegram(chatId, lines.join('\n'));
+      } else if (command === '/stop') {
+        store.updateUser(user.id, { isActive: false });
+        await sendToTelegram(
+          chatId,
+          '<b>Akun dinonaktifkan.</b>\nHubungi admin jika ingin mengaktifkan kembali akses OTP.'
         );
       }
     }
-  } catch (err) {
-    // Silently handle polling errors
+  } catch (error) {
+    console.error('Telegram polling error:', error.message);
+  } finally {
+    polling = false;
+    setTimeout(pollTelegramUpdates, 3000);
   }
 }
 
-// Start polling every 3 seconds
-setInterval(pollTelegramUpdates, 3000);
+setTimeout(pollTelegramUpdates, 2000);
 
-// ==================== WEBHOOK ENDPOINT ====================
-app.post('/webhook', async (req, res) => {
-  try {
-    console.log('\n📩 Webhook received:', JSON.stringify(req.body, null, 2));
-
-    const data = req.body;
-    const sender = data.sender || data.title || data.from || '';
-    const text = data.text || data.message || data.content || '';
-
-    if (!text) {
-      console.log('⚠️ Pesan kosong, skip.');
-      return res.json({ status: 'skipped', reason: 'empty message' });
-    }
-
-    if (!shouldForward(sender)) {
-      console.log(`⚠️ Sender "${sender}" tidak di filter, skip.`);
-      return res.json({ status: 'skipped', reason: 'filtered out' });
-    }
-
-    // Extract OTP — skip jika tidak ada OTP
-    const otp = extractOTP(text);
-    if (!otp) {
-      console.log('⚠️ Tidak ada OTP terdeteksi, skip.');
-      return res.json({ status: 'skipped', reason: 'no OTP detected' });
-    }
-
-    console.log(`🔑 OTP detected: ${otp} from ${sender}`);
-    logMessage({ sender, text: `OTP: ${otp}` });
-
-    const formatted = formatOTPMessage(sender, otp);
-    const sentCount = await broadcastToSubscribers(formatted);
-
-    return res.json({
-      status: sentCount > 0 ? 'forwarded' : 'no_subscribers',
-      otp,
-      sender,
-      sentTo: sentCount,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error('❌ Error processing webhook:', err.message);
-    return res.status(500).json({ status: 'error', message: err.message });
-  }
-});
-
-// ==================== GET ENDPOINT (alternative) ====================
-app.get('/forward', async (req, res) => {
-  try {
-    const sender = req.query.sender || req.query.from || 'Unknown';
-    const text = req.query.text || req.query.message || '';
-
-    if (!text) return res.json({ status: 'skipped', reason: 'empty message' });
-    if (!shouldForward(sender)) return res.json({ status: 'skipped', reason: 'filtered out' });
-
-    const otp = extractOTP(text);
-    if (!otp) return res.json({ status: 'skipped', reason: 'no OTP detected' });
-
-    logMessage({ sender, text: `OTP: ${otp}` });
-    const formatted = formatOTPMessage(sender, otp);
-    const sentCount = await broadcastToSubscribers(formatted);
-
-    return res.json({ status: sentCount > 0 ? 'forwarded' : 'no_subscribers', otp, sentTo: sentCount });
-  } catch (err) {
-    return res.status(500).json({ status: 'error', message: err.message });
-  }
-});
-
-// ==================== HEALTH CHECK ====================
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    service: 'WA Chat Forwarder',
-    subscribers: Object.keys(subscribers).length,
-    uptime: process.uptime(),
-    endpoints: {
-      webhook: 'POST /webhook { sender, text }',
-      forward: 'GET /forward?sender=xxx&text=xxx',
-      logs: 'GET /logs',
-    },
-  });
-});
-
-// ==================== VIEW LOGS ====================
-app.get('/logs', (req, res) => {
-  try {
-    if (!fs.existsSync(LOG_FILE)) return res.json({ logs: [] });
-    const logs = fs.readFileSync(LOG_FILE, 'utf-8').split('\n').filter(Boolean).slice(-50);
-    return res.json({ count: logs.length, logs });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// ==================== START ====================
 app.listen(PORT, () => {
-  console.log(`\n🚀 WA Chat Forwarder running on port ${PORT}`);
-  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-  console.log(`📌 Webhook:  http://YOUR_IP:${PORT}/webhook`);
-  console.log(`📌 Forward:  http://YOUR_IP:${PORT}/forward?sender=xxx&text=xxx`);
-  console.log(`📌 Health:   http://YOUR_IP:${PORT}/`);
-  console.log(`📌 Logs:     http://YOUR_IP:${PORT}/logs`);
-  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-  console.log(`👥 Subscribers: ${Object.keys(subscribers).length}`);
-  if (FILTER_NUMBERS.length > 0) {
-    console.log(`🔍 Filter: ${FILTER_NUMBERS.join(', ')}`);
-  } else {
-    console.log(`🔍 Filter: OFF (forward semua)`);
-  }
-  console.log(`\n💡 Siapa saja bisa /start bot Telegram untuk menerima forward.`);
-  console.log(`   Tidak perlu set Chat ID manual!\n`);
+  console.log(`OTP Control Room running on port ${PORT}`);
+  console.log(`Admin panel: http://localhost:${PORT}/admin/login`);
+  console.log(`Webhook: POST http://localhost:${PORT}/webhook`);
+  console.log(`Forward: GET http://localhost:${PORT}/forward`);
 });
